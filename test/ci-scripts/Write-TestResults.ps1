@@ -8,11 +8,13 @@ Typical scenario is that results will be passed in for only one cloud Public or 
 param(
     [string]$SampleFolder = $ENV:SAMPLE_FOLDER, # this is the full absolute path to the sample
     [string]$SampleName = $ENV:SAMPLE_NAME, # the name of the sample or folder path from the root of the repo (i.e. relative path) e.g. "sample-type/sample-name"
-    [string]$StorageAccountResourceGroupName = "azure-quickstarts-service-storage",
-    [string]$StorageAccountName = "azurequickstartsservice",
+    [string]$StorageAccountName = $ENV:STORAGE_ACCOUNT_NAME,
     [string]$TableName = "QuickStartsMetadataService",
     [string]$TableNamePRs = "QuickStartsMetadataServicePRs",
-    [Parameter(mandatory = $true)]$StorageAccountKey, 
+    [string]$BadgesContainerName = "badges",
+    [string]$PRsContainerName = "prs",
+    [string]$RegressionsTableName = "Regressions",
+    [Parameter(mandatory = $true)][string]$StorageAccountKey, 
     [string]$BestPracticeResult = "$ENV:RESULT_BEST_PRACTICE",
     [string]$CredScanResult = "$ENV:RESULT_CREDSCAN",
     [string]$BuildReason = "$ENV:BUILD_REASON",
@@ -23,18 +25,64 @@ param(
     [string]$FairfaxDeployment = "",
     [string]$FairfaxLastTestDate = (Get-Date -Format "yyyy-MM-dd").ToString(),
     [string]$PublicDeployment = "",
-    [string]$PublicLastTestDate = (Get-Date -Format "yyyy-MM-dd").ToString()
+    [string]$PublicLastTestDate = (Get-Date -Format "yyyy-MM-dd").ToString(),
+    [string]$BicepVersion = $ENV:BICEP_VERSION, # empty if bicep not supported by the sample
+    [string]$TemplateAnalyzerResult = "$ENV:TEMPLATE_ANALYZER_RESULT",
+    [string]$TemplateAnalyzerOutputFilePath = "$ENV:TEMPLATE_ANALYZER_OUTPUT_FILEPATH",
+    [string]$TemplateAnalyzerLogsContainerName = "$ENV:TEMPLATE_ANALYZER_LOGS_CONTAINER_NAME"
 )
 
+function Get-Regression(
+    [object] $oldRow,
+    [object] $newRow,
+    [string] $propertyName
+) {
+    $oldValue = $oldRow.$propertyName
+    $newValue = $newRow.$propertyName
+
+    Write-Host "Comparison results for ${propertyName}: '$oldValue' -> '$newValue'"
+
+    if (![string]::IsNullOrWhiteSpace($newValue)) { 
+        $oldResultPassed = $oldValue -eq "PASS"
+        $newResultPassed = $newValue -eq "PASS"
+
+        if ($oldResultPassed -and !$newResultPassed) {
+            Write-Warning "REGRESSION: $propertyName changed from '$oldValue' to '$newValue'"
+            return $true
+        }
+    }
+
+    return $false
+}
+
+function Convert-EntityToHashtable([PSCustomObject] $entity) {
+    $hashtable = New-Object -Type Hashtable
+    $entity | Get-Member -MemberType NoteProperty | ForEach-Object {
+        $name = $_.Name
+        if ($name -ne "PartitionKey" -and $name -ne "RowKey" -and $name -ne "Etag" -and $name -ne "TableTimestamp") {
+            $hashtable[$name] = $entity.$Name
+        }
+    }
+        
+    return $hashtable
+}
 
 # Get the storage table that contains the "status" for the deployment/test results
+Write-Host "Storage account name: $StorageAccountName"
 $ctx = New-AzStorageContext -StorageAccountName $StorageAccountName -StorageAccountKey $StorageAccountKey -Environment AzureCloud
 
+$isPullRequest = $false
 if ($BuildReason -eq "PullRequest") {
+    $isPullRequest = $true
     $t = $TableNamePRs
 }
 else {
     $t = $TableName
+}
+Write-Host "Writing to table $t"
+
+if (($BicepVersion -ne "") -and !($BicepVersion -match "^[0-9]+\.[-0-9a-z.]+$")) {
+    Write-Error "Unexpected bicep version format: $BicepVersion.  This may be caused by a previous error in the pipeline"
 }
 
 $cloudTable = (Get-AzStorageTable –Name $t –Context $ctx).CloudTable
@@ -49,8 +97,18 @@ Write-Host "RowKey: $RowKey"
 $Metadata = Get-Content $PathToMetadata -Raw | ConvertFrom-Json
 $PartitionKey = $Metadata.Type # if the type changes we'll have an orphaned row, this is removed in Get-OldestSampleFolder.ps1
 
-#Get the row to update
+#Get the row to update (from either the main table or the PR table, depending on $isPullRequest)
 $r = Get-AzTableRow -table $cloudTable -PartitionKey $PartitionKey -RowKey $RowKey
+
+#Get the row to compare for regressions (always from the main table)
+$comparisonCloudTable = (Get-AzStorageTable –Name $TableName –Context $ctx).CloudTable
+$comparisonResults = Get-AzTableRow -table $comparisonCloudTable -PartitionKey $PartitionKey -RowKey $RowKey
+Write-Host "Comparison table for previous results: $TableName"
+Write-Host "Comparison table current results: $comparisonResults"
+
+if ($isPullRequest) {
+    # For pull requests, we want to check for regressions against the main table, not the PR table
+}
 
 # if the build was cancelled and this was a scheduled build, we need to set the metadata status back to "Live"
 if ($r -ne $null -and $AgentJobStatus -eq "Canceled" -and $BuildReason -ne "PullRequest") {
@@ -73,15 +131,18 @@ $FairfaxDeployment = $FairfaxDeployment -ireplace [regex]::Escape("true"), "PASS
 $FairfaxDeployment = $FairfaxDeployment -ireplace [regex]::Escape("false"), "FAIL"
 $PublicDeployment = $PublicDeployment -ireplace [regex]::Escape("true"), "PASS"
 $PublicDeployment = $PublicDeployment -ireplace [regex]::Escape("false"), "FAIL"
+$TemplateAnalyzerResult = $TemplateAnalyzerResult -ireplace [regex]::Escape("true"), "PASS"
+$TemplateAnalyzerResult = $TemplateAnalyzerResult -ireplace [regex]::Escape("false"), "FAIL"
 
 Write-Host "Supported Environments Found: $supportedEnvironmentsJson"
 $supportedEnvironments = ($supportedEnvironmentsJson | ConvertFrom-JSON -AsHashTable)
 
-if($ValidationType -eq "Manual") { # otherwise this is already set to "Not Supported"
-    if($supportedEnvironments.Contains("AzureUSGovernment")){
+# otherwise this is already set to "Not Supported"
+if ($ValidationType -eq "Manual") {
+    if ($supportedEnvironments.Contains("AzureUSGovernment")) {
         $FairfaxDeployment = "Manual Test" 
     }
-    if($supportedEnvironments.Contains("AzureCloud")){
+    if ($supportedEnvironments.Contains("AzureCloud")) {
         $PublicDeployment = "Manual Test"
     }
 }
@@ -96,9 +157,15 @@ if ($r -eq $null) {
         Write-Host "Adding BP results to hashtable..."
         $results.Add("BestPracticeResult", $BestPracticeResult)
     }
+    Write-Host "Adding Bicep version to hashtable..."
+    $results.Add("BicepVersion", $BicepVersion)
     Write-Host "CredScan Result: $CredScanResult"
     if (![string]::IsNullOrWhiteSpace($CredScanResult)) {
         $results.Add("CredScanResult", $CredScanResult)
+    }
+    Write-Host "TemplateAnalyzer result: $TemplateAnalyzerResult"
+    if (![string]::IsNullOrWhiteSpace($TemplateAnalyzerResult)) {
+        $results.Add("TemplateAnalyzerResult", $TemplateAnalyzerResult)
     }
     # set the values for Fairfax only if a result was passed
     Write-Host "FF Result"
@@ -129,6 +196,7 @@ if ($r -eq $null) {
     Write-Host "New Record: Dump results variable"
 
     $results | fl *
+    $newResults = $results.PSObject.copy()
     Write-Host "New Record: Add-AzTableRow"
 
     Add-AzTableRow -table $cloudTable `
@@ -148,6 +216,22 @@ else {
         }
         else {
             $r.BestPracticeResult = $BestPracticeResult
+        }
+    }
+    if (![string]::IsNullOrWhiteSpace($TemplateAnalyzerResult)) {
+        if ($r.TemplateAnalyzerResult -eq $null) {
+            Add-Member -InputObject $r -NotePropertyName 'TemplateAnalyzerResult' -NotePropertyValue $TemplateAnalyzerResult
+        }
+        else {
+            $r.TemplateAnalyzerResult = $TemplateAnalyzerResult
+        }
+    }
+    if (![string]::IsNullOrWhiteSpace($BicepVersion)) {
+        if ($r.BicepVersion -eq $null) {
+            Add-Member -InputObject $r -NotePropertyName 'BicepVersion' -NotePropertyValue $BicepVersion
+        }
+        else {
+            $r.BicepVersion = $BicepVersion
         }
     }
     if (![string]::IsNullOrWhiteSpace($CredScanResult)) {
@@ -257,6 +341,37 @@ else {
     Write-Host "Updating to new results:"
     $r | fl *
     $r | Update-AzTableRow -table $cloudTable
+
+    $newResults = $r.PSObject.copy()
+}
+
+# Check for regressions with latest non-PR run
+$BPRegressed = Get-Regression $comparisonResults $newResults "BestPracticeResult"
+$FairfaxRegressed = Get-Regression $comparisonResults $newResults "FairfaxDeployment"
+$PublicRegressed = Get-Regression $comparisonResults $newResults "PublicDeployment"
+$TemplateAnalyzerRegressed = Get-Regression $comparisonResults $newResults "TemplateAnalyzerResult"
+
+$AnyRegressed = $BPRegressed -or $FairfaxRegressed -or $PublicRegresse
+
+if (!$isPullRequest) {
+    Write-Host "Writing regression info to table '$RegressionsTableName'"
+    $regressionsTable = (Get-AzStorageTable –Name $RegressionsTableName –Context $ctx).CloudTable
+    $regressionsKey = Get-Date -Format "o"
+    $regressionsRow = $newResults.PSObject.copy()
+    $regressionsRow | Add-Member "Sample" $RowKey
+    $regressionsRow | Add-Member "AnyRegressed" $AnyRegressed
+    $regressionsRow | Add-Member "BPRegressed" $BPRegressed
+    $regressionsRow | Add-Member "FairfaxRegressed" $FairfaxRegressed
+    $regressionsRow | Add-Member "PublicRegressed" $PublicRegressed
+    $regressionsRow | Add-Member "TemplateAnalyzerRegressed" $TemplateAnalyzerRegressed
+    $regressionsRow | Add-Member "BuildNumber" $ENV:BUILD_BUILDNUMBER
+    $regressionsRow | Add-Member "BuildId" $ENV:BUILD_BUILDID
+    $regressionsRow | Add-Member "Build" "https://dev.azure.com/azurequickstarts/azure-quickstart-templates/_build/results?buildId=$($ENV:BUILD_BUILDID)"
+    Add-AzTableRow -table $regressionsTable `
+        -partitionKey $PartitionKey `
+        -rowKey $regressionsKey `
+        -property (Convert-EntityToHashtable $regressionsRow) `
+        -Verbose
 }
 
 <#
@@ -329,7 +444,7 @@ switch ($BestPracticeResult) {
     "FAIL" { $BestPracticeResultColor = "red" }
     default {
         $BestPracticeResult = $na
-        $CredScanResultColor = "inactive"    
+        $BestPracticeResultColor = "inactive"    
     }
 }
 
@@ -345,6 +460,18 @@ switch ($CredScanResult) {
         $CredScanResultColor = "inactive"    
     }
 }
+
+switch ($TemplateAnalyzerResult) {
+    "PASS" { $TemplateAnalyzerResultColor = "brightgreen" }
+    "FAIL" { $TemplateAnalyzerResultColor = "red" }
+    default {
+        $TemplateAnalyzerResult = $na
+        $TemplateAnalyzerResultColor = "inactive"    
+    }
+}
+
+$BicepVersionColor = "brightgreen";
+if ($BicepVersion -eq "") { $BicepVersion = "n/a" } # make sure the badge value is not empty
 
 $badges = @(
     @{
@@ -371,32 +498,62 @@ $badges = @(
     @{
         "url"      = "https://img.shields.io/badge/CredScan%20Check-$CredScanResult-/?color=$CredScanResultColor";
         "filename" = "CredScanResult.svg"
+    },
+    @{
+        "url"      = "https://img.shields.io/badge/Bicep%20Version-$BicepVersion-/?color=$BicepVersionColor";
+        "filename" = "BicepVersion.svg"
+    },
+    @{
+        "url"      = "https://img.shields.io/badge/Template%20Analyzer%20Check-$TemplateAnalyzerResult-/?color=$TemplateAnalyzerResultColor";
+        "filename" = "TemplateAnalyzerResult.svg"
     }
 )
 
 Write-Host "Uploading Badges..."
+$tempFolder = [System.IO.Path]::GetTempPath();
 foreach ($badge in $badges) {
-    (Invoke-WebRequest -Uri $($badge.url)).Content | Set-Content -Path $badge.filename -Force
+    $badgeTempPath = Join-Path $tempFolder $badge.filename
+    (Invoke-WebRequest -Uri $($badge.url)).Content | Set-Content -Path $badgeTempPath -Force
     <#
         if this is just a PR, we don't want to overwrite the live badges until it's merged
         just create the badges in the "pr" folder and they will be copied over by a CI build when merged
         scheduled builds should be put into the "live" container (i.e. badges)
     #>
     if ($BuildReason -eq "PullRequest") {
-        $containerName = "prs"
+        $containerName = $PRsContainerName
     }
     else {
-        $containerName = "badges"
+        $containerName = $BadgesContainerName
     }
 
     $badgePath = $RowKey.Replace("@", "/")
 
+    $blobName = "$badgePath/$($badge.filename)"
+    Write-Output "Uploading badge to storage account '$($StorageAccountName)', container '$($containerName)', name '$($blobName)':"
+    $badge | fl | Write-Output
     Set-AzStorageBlobContent -Container $containerName `
-        -File $badge.filename `
-        -Blob "$badgePath/$($badge.filename)" `
+        -File $badgeTempPath `
+        -Blob $blobName `
         -Context $ctx `
         -Properties @{"ContentType" = "image/svg+xml"; "CacheControl" = "no-cache" } `
         -Force -Verbose
+}
+
+# Upload BPA results file:
+$templateAnalyzerLogFileName = "$($ENV:BUILD_BUILDNUMBER)_$RowKey"
+Write-Host "Uploading TemplateAnalyzer log file: $templateAnalyzerLogFileName"
+try {
+    Set-AzStorageBlobContent -Container $TemplateAnalyzerLogsContainerName `
+        -File $TemplateAnalyzerOutputFilePath `
+        -Blob $templateAnalyzerLogFileName `
+        -Context $ctx `
+        -Properties @{ "ContentType" = "text/plain" } `
+        -Force -Verbose
+}
+catch {
+    Write-Host "===================================================="
+    Write-Host " Failed to upload $TemplateAnalyzerOutputFilePath   "
+    Write-Host "===================================================="
 }
 
 <#Debugging only
